@@ -6,35 +6,24 @@
 
 using BinaryBuilder, Pkg
 
-include("../../../fancy_toys.jl")
+include("../common.jl")
+
+const YGGDRASIL_DIR = "../../.."
+include(joinpath(YGGDRASIL_DIR, "fancy_toys.jl"))
+include(joinpath(YGGDRASIL_DIR, "platforms", "cuda.jl"))
 
 name = "CUDA_Driver"
-version = v"0.12.1"
-
-cuda_version = v"12.8"
-cuda_version_str = "$(cuda_version.major)-$(cuda_version.minor)"
-driver_version_str = "570.124.06"
-build = 1
-
-sources_linux_x86 = [
-    FileSource("https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-compat-$(cuda_version_str)-$(driver_version_str)-$(build).el8.x86_64.rpm",
-               "1ddd595b6a7cd33414a8a4e1a05ab4d4c7d7b4b1d3aea87b347acd46da81399f", "compat.rpm")
-]
-sources_linux_aarch64 = [
-    FileSource("https://developer.download.nvidia.com/compute/cuda/repos/rhel8/sbsa/cuda-compat-$(cuda_version_str)-$(driver_version_str)-$(build).el8.aarch64.rpm",
-               "21869895263fb0f0ee9ed77a4d41e56349d50cfaaff3f8b8f213154a26d0f57c", "compat.rpm")
-]
-
-dependencies = []
+cuda_version = v"13.1"
+driver_version = "590.48.01"
 
 script = raw"""
-    apk update
-    apk add rpm2cpio
-    rpm2cpio compat.rpm | cpio -idmv
-
     mkdir -p ${libdir}
 
-    mv usr/local/cuda-*/compat/* ${libdir}
+    cd ${WORKSPACE}/srcdir/cuda_compat*
+
+    install_license LICENSE
+
+    mv compat/* ${libdir}
 """
 
 # CUDA_Driver_jll provides libcuda_compat, but we can't always use that driver: It requires
@@ -55,20 +44,39 @@ init_block = map(eachline(IOBuffer(init_block))) do line
 products = [
     LibraryProduct("libcuda", :libcuda_compat;                            dont_dlopen=true),
     LibraryProduct("libcudadebugger", :libcuda_debugger;                  dont_dlopen=true),
+    LibraryProduct("libnvidia-gpucomp", :libnvidia_gpucomp;               dont_dlopen=true),
     LibraryProduct("libnvidia-nvvm", :libnvidia_nvvm;                     dont_dlopen=true),
     LibraryProduct("libnvidia-ptxjitcompiler", :libnvidia_ptxjitcompiler; dont_dlopen=true),
+    LibraryProduct("libnvidia-tileiras", :libnvidia_tileiras;             dont_dlopen=true),
 ]
 
-non_reg_ARGS = filter(arg -> arg != "--register", ARGS)
+dependencies = []
 
-if should_build_platform("x86_64-linux-gnu")
-    build_tarballs(non_reg_ARGS, name, version, sources_linux_x86, script,
-                   [Platform("x86_64", "linux")], products, dependencies;
-                   skip_audit=true, init_block)
+platforms = [Platform("x86_64", "linux"),
+             Platform("aarch64", "linux")]
+
+builds = []
+for platform in platforms
+    augmented_platform = deepcopy(platform)
+    augmented_platform["cuda"] = CUDA.platform(cuda_version)
+    should_build_platform(triplet(augmented_platform)) || continue
+
+    sources = get_sources("nvidia-driver", ["cuda_compat"]; version=driver_version,
+                          platform=augmented_platform, variant="cuda$(cuda_version.major).$(cuda_version.minor)")
+
+    push!(builds, (; platforms=[platform], sources))
 end
 
-if should_build_platform("aarch64-linux-gnu")
-    build_tarballs(ARGS, name, version, sources_linux_aarch64, script,
-                   [Platform("aarch64", "linux")], products, dependencies;
+# don't allow `build_tarballs` to override platform selection based on ARGS.
+# we handle that ourselves by calling `should_build_platform`
+non_platform_ARGS = filter(arg -> startswith(arg, "--"), ARGS)
+
+# `--register` should only be passed to the latest `build_tarballs` invocation
+non_reg_ARGS = filter(arg -> arg != "--register", non_platform_ARGS)
+
+for (i,build) in enumerate(builds)
+    build_tarballs(i == lastindex(builds) ? non_platform_ARGS : non_reg_ARGS,
+                   name, cuda_version, build.sources, script,
+                   build.platforms, products, dependencies;
                    skip_audit=true, init_block)
 end
